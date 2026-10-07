@@ -57,8 +57,13 @@ def _local_target(claims: dict[str, Any] | None, _api_request_profile) -> tuple[
     return profile, installation_id
 
 
-def _local_room_catalog(self, profile: str, installation_id: str) -> tuple[dict, dict]:
+def _local_room_catalog(self, profile: str, installation_id: str, *, typed_authority=None) -> tuple[dict, dict]:
     """Return ``(execution_policy, catalog)`` for this gateway's *profile*."""
+    if typed_authority is not None:
+        from gateway.platforms.api_server_typed_tasks import validate_authority, typed_catalog
+        validate_authority(typed_authority)
+        catalog = typed_catalog(profile, installation_id)
+        return catalog["execution_policy"], catalog
     from gateway.hosted_room_peer import PROTOCOL_VERSION, catalog_mapping
     from gateway.hosted_room_execution_policy import execution_policy_mapping
     with self._profile_scope(profile):
@@ -118,7 +123,7 @@ async def _handle_room_member_invitation(
     if error:
         return error
     required = set(_ROOM_IDENTITY_FIELDS)
-    allowed = required | {"grant_id", "ttl_seconds", "status_ttl_seconds"}
+    allowed = required | {"grant_id", "ttl_seconds", "status_ttl_seconds", "typed_authority"}
     if set(body) - allowed or not required <= set(body):
         return _json_error(
             _openai_error, "Invitation is missing required room authority fields.",
@@ -133,14 +138,28 @@ async def _handle_room_member_invitation(
         status_ttl = float(body.get("status_ttl_seconds", ttl))
         if not ttl <= status_ttl <= 30 * 24 * 60 * 60:
             raise ValueError("status_ttl_seconds must be at least ttl_seconds and no more than 2592000")
-        execution_policy, catalog = _local_room_catalog(self, profile, target_install_id)
+        typed_authority = body.get("typed_authority")
+        if "typed_authority" in body and typed_authority is None:
+            raise ValueError("typed_authority must be an object")
+        execution_policy, catalog = _local_room_catalog(
+            self, profile, target_install_id, typed_authority=typed_authority)
+        if typed_authority is not None:
+            from gateway.hosted_rooms_common import secure_sqlite_files
+            try:
+                private_storage = secure_sqlite_files(hosted_rooms.default_db_path(), create=True)
+            except OSError:
+                private_storage = False
+            if not private_storage:
+                return _json_error(_openai_error,
+                    "Typed delegation requires verified private storage.",
+                    code="typed_private_storage_required", status=503)
         token = issue_room_grant(
             self._room_grant_secret(),
             grant_id=str(body.get("grant_id") or f"grant-{uuid.uuid4().hex}"),
             **_room_identity(body, coerce=True),
             target_install_id=target_install_id, target_profile=profile,
             execution_policy_digest=execution_policy["policy_digest"], issued_at=time.time(),
-            ttl_seconds=ttl, status_ttl_seconds=status_ttl)
+            ttl_seconds=ttl, status_ttl_seconds=status_ttl, typed_authority=typed_authority)
         claims = decode_room_grant(self._room_grant_secret(), token, permission="status")
         hosted_rooms.reserve_peer_room(
             hosted_rooms.default_db_path(), claims=claims, expires_at=_hard_expiry(claims))
@@ -158,7 +177,8 @@ async def _handle_room_member_capabilities(
     try:
         claims = self._room_grant_claims(request, permission="status")
         profile, installation_id = _local_target(claims, _api_request_profile)
-        _, catalog = _local_room_catalog(self, profile, installation_id)
+        _, catalog = _local_room_catalog(self, profile, installation_id,
+            typed_authority=claims.get("typed_authority"))
     except Exception as exc:
         return _room_grant_error_response(exc, _openai_error=_openai_error)
     return web.json_response({
@@ -189,15 +209,19 @@ async def _handle_room_member_grant_refresh(
         if remaining <= 0 or requested <= 0:
             raise ValueError("room grant renewal horizon expired")
         dispatch_ttl = min(requested, MAX_DISPATCH_GRANT_TTL_SECONDS, remaining)
-        with self._profile_scope(profile):
-            execution_policy = execution_policy_mapping(target_profile=profile)
+        if "typed_authority" in claims:
+            execution_policy, _ = _local_room_catalog(self, profile, installation_id,
+                typed_authority=claims["typed_authority"])
+        else:
+            with self._profile_scope(profile):
+                execution_policy = execution_policy_mapping(target_profile=profile)
         _require_unchanged_execution_policy(claims, execution_policy)
         token = issue_room_grant(
             self._room_grant_secret(), grant_id=f"grant-refresh-{uuid.uuid4().hex}",
             **_room_identity(claims), target_install_id=installation_id, target_profile=profile,
             execution_policy_digest=execution_policy["policy_digest"],
             permissions=claims["permissions"], issued_at=now, ttl_seconds=dispatch_ttl,
-            status_expires_at=hard_expiry)
+            status_expires_at=hard_expiry, typed_authority=claims.get("typed_authority"))
     except Exception as exc:
         return _room_grant_error_response(exc, _openai_error=_openai_error)
     return web.json_response({

@@ -76,7 +76,9 @@ async def _normalize_room_dispatch(
         from gateway.hosted_room_execution_policy import RoomExecutionPolicy
         from gateway.platforms.api_server_room_grants import _local_room_catalog
         dispatch = HostedMemberDispatch.from_mapping(body.get("hosted_room_dispatch"))
-        verify_room_grant(self._room_grant_secret(), room_token, dispatch, permission="dispatch")
+        claims = verify_room_grant(self._room_grant_secret(), room_token, dispatch, permission="dispatch")
+        if "typed_authority" in claims:
+            raise ValueError("typed grants cannot dispatch generic agent work")
         active_profile = _api_server._api_request_profile.get() or "default"
         local_install = hosted_rooms.local_authority_gateway_id()
         if dispatch.target_profile != active_profile or dispatch.target_install_id != local_install:

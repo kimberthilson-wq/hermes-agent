@@ -465,6 +465,141 @@ When `session_id` identifies an existing Hermes session and no explicit
 that session's active transcript. Session turn leases serialize concurrent
 writers and refresh the transcript after a contended wait.
 
+
+### Bounded typed RoomLink delegations
+
+The same `POST /v1/runs` endpoint supports one deterministic no-tool operation,
+`hermes.acceptance.echo`. Its delegated service principal uses the existing
+gateway/member/install/profile identity. It creates no agent or conversation,
+invokes no provider, discovers no tools, loads no memory/profile/project
+context and requests no approval. Payload text is inert data. The route grants
+no Jarvis Brain or Vault access. Generic agent, shell and file-tool delegation
+are unavailable to typed grants and require a separately approved isolation
+design.
+
+Provision a scoped grant through administrative
+`POST /v1/room-members/invitations`, adding this authority object to the normal
+room identity fields:
+
+```json
+{
+  "typed_authority": {
+    "version": 1,
+    "task_types": ["hermes.acceptance.echo"],
+    "project_scopes": ["hermes.selftest"],
+    "capability_ceiling": [],
+    "max_runtime_ms": 5000
+  }
+}
+```
+
+Only this closed task/scope/empty-capability combination is supported.
+The integer `max_runtime_ms` may be narrowed to 1 through 5000.
+The invitation returns `catalog.execution_policy.policy_digest` and
+`catalog.catalog_digest`. Typed grants can dispatch, read status/events and
+stop their owned runs. Refresh preserves their authority. They cannot authorize
+generic/admin endpoints or acquire approval authority. The admin key provisions
+grants; it cannot substitute for typed-task RoomLink authority.
+
+Send `Authorization: HermesRoom <scoped-grant>` and
+`Idempotency-Key: room:<task_id>:<execution_generation>`. The body must contain
+exactly `typed_delegation`, without session, model, instructions, history,
+tools, credentials or extra context:
+
+```json
+{
+  "typed_delegation": {
+    "room_id": "jarvis-selftest",
+    "home_install_id": "jarvis-install",
+    "authority_gateway_id": "jarvis-service",
+    "authority_epoch": 1,
+    "member_id": "jarvis-worker",
+    "target_install_id": "<catalog.installation_id>",
+    "target_profile": "default",
+    "task_id": "acceptance-1",
+    "execution_generation": 1,
+    "trace_id": "acceptance-trace-1",
+    "protocol_version": 2,
+    "task_type": "hermes.acceptance.echo",
+    "project_scope": "hermes.selftest",
+    "capability_ceiling": [],
+    "execution_policy_digest": "<catalog.execution_policy.policy_digest>",
+    "capability_digest": "<catalog.catalog_digest>",
+    "payload": {"message": "synthetic-value"},
+    "max_runtime_ms": 5000
+  }
+}
+```
+
+The grant must match every room/member/authority/recipient coordinate.
+Task and trace IDs are canonical identifiers of at most 128 characters;
+generation is an integer from 1 through 2147483647. Message is strict UTF-8
+text of at most 1024 bytes (empty text is accepted). The only optional payload
+field is `scheduling_delay_ms`, an integer from 0 through 1000 providing a
+bounded in-process scheduling interval for deadline/cancellation verification.
+There is no shell sleep or process. The deadline must fit the signed maximum.
+Unknown tasks/scopes, capability widening, invalid digests and extra payload
+fields are denied before execution.
+
+HTTP 202 returns the existing server `run_id`. Poll the existing run endpoint
+with the scoped grant. Successful `output` contains only the message's UTF-8
+`sha256` and `utf8_bytes`; raw message text is not returned or persisted.
+Server-generated `provenance` contains the room identity fields plus:
+
+- run_id, task_id, execution_generation, trace_id, task_type, project_scope
+- capability_ceiling, capability_digest, execution_policy_digest, input_digest
+- target_install_id, target_profile, protocol_version, interface_version
+- max_runtime_ms, created_at, started_at, terminal_at, terminal_status, error_category
+
+`input_digest` hashes canonical payload JSON; `interface_version` is
+`hermes.typed.v1`. Timestamps are Unix seconds; unreached timestamps are null.
+Completed results have a null error category. Handler failures use a fixed
+category without exposing exception text.
+
+Exact replay reuses the original run within the retained status horizon,
+including after restart. Fingerprints
+bind the entire request, signed authority, authenticated identity and
+interface/policy version. Changed payload/scope/capabilities/task/generation or
+authority under one key returns 409. Equivalent renewed grants preserve replay.
+Typed run owners use a separate namespace from generic RoomLink/API owners.
+
+Callers must compare provenance with the original request and current
+generation, verify the expected output digest and reject stale/malformed data
+before accepting success. The reusable
+`gateway.platforms.api_server_typed_tasks.validate_result(status, expected)`
+checks structure, lifecycle and supplied correlation fields, including optional
+`expected.not_before` (minimum creation timestamp). Polling supports query
+assertions `expected_task_id`, `expected_execution_generation`,
+`expected_project_scope`, `expected_capability_digest`, `expected_trace_id`
+and `not_before`; mismatch returns 409 `typed_result_mismatch`.
+Result integrity relies on authenticated transport and the server-owned
+lifecycle, without an independent result signature. Prefer the existing API on
+loopback over authenticated SSH.
+
+The monotonic budget starts at admission. Expiry latches `timed_out` with
+category `deadline_exceeded`. Stop latches `cancelled` immediately for typed
+runs. Late completion cannot replace either terminal result or expose output;
+`late_result_discarded: true` records only a bounded diagnostic.
+`remote_cancel_confirmed` describes the authoritative result fence;
+`remote_effect_unknown: false` applies to this pure no-side-effect operation.
+These fields do not promise physical termination of generic remote processes.
+The bounded handler stays in concurrency/drain accounting until it finishes.
+
+Only existing run/idempotency/provenance security metadata is retained. The
+existing grant status horizon is bounded to 30 days; terminal store rows are
+pruned on admission/lookup. No conversation, memory, profile or project
+artifacts are created. Sensitive shared-state and idempotency DB/WAL/SHM files
+are created and checked owner-only (0600 on POSIX). Unsafe file type, ownership
+or failed permission repair fails closed. Keep grant references/tokens in the
+caller's protected credential store; never include them in payloads or logs.
+
+Typed invitation and dispatch require verified owner-only storage. POSIX
+permissions are verified for the database and existing sidecars; unsupported
+platforms, including Windows without verified private storage, reject typed
+delegation with HTTP 503. Generic storage remains available under its existing
+platform behavior. This interface does not introduce a Windows ACL policy.
+
+
 ### GET /v1/runs/\{run_id\}
 
 Poll the current run state. This is useful for dashboards that need status without holding an SSE connection open, or for UIs that reconnect after navigation.

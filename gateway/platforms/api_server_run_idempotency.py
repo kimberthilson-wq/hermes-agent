@@ -7,7 +7,6 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Dict
 
 from hermes_cli.sqlite_util import add_column_if_missing
@@ -16,7 +15,7 @@ from hermes_cli.sqlite_util import add_column_if_missing
 # Keep the extracted store's log records on the API server logger.
 logger = logging.getLogger("gateway.platforms.api_server")
 
-TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted"})
+TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "interrupted", "timed_out"})
 
 _SELECT_BY_KEY = (
     "SELECT fingerprint, run_id, status_json, owner_pid, owner_started, updated_at "
@@ -62,6 +61,18 @@ class RunIdempotencyStore:
     def durable(self) -> bool:
         """Whether reservations survive this process."""
         return self._db_path is not None
+
+    @property
+    def private_storage_verified(self) -> bool:
+        """Whether disk state has verified owner-only protection for typed use."""
+        if not self._db_path:
+            return False
+        try:
+            self._tighten_permissions()
+        except OSError:
+            self._private_storage_verified = False
+        return self._private_storage_verified
+
     def __init__(self, db_path: str = None):
         if db_path is None:
             try:
@@ -70,6 +81,10 @@ class RunIdempotencyStore:
             except Exception:
                 db_path = ":memory:"
         self._db_path = None if db_path == ":memory:" else db_path
+        from gateway.hosted_rooms_common import secure_sqlite_files
+        self._private_storage_verified = False
+        if self._db_path:
+            self._private_storage_verified = secure_sqlite_files(self._db_path, create=True)
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
         except Exception as exc:
@@ -108,16 +123,16 @@ class RunIdempotencyStore:
             "CREATE UNIQUE INDEX IF NOT EXISTS run_idempotency_run_id ON run_idempotency(run_id)")
         self._conn.commit()
         self._lock = threading.Lock()
-        self._tighten_permissions()
+        try:
+            self._tighten_permissions()
+        except BaseException:
+            self._conn.close()
+            raise
 
     def _tighten_permissions(self) -> None:
-        for suffix in ("", "-wal", "-shm") if self._db_path else ():
-            candidate = Path(self._db_path + suffix)
-            try:
-                if candidate.exists():
-                    candidate.chmod(0o600)
-            except OSError:
-                logger.debug("Failed to restrict run idempotency store permissions", exc_info=True)
+        if self._db_path:
+            from gateway.hosted_rooms_common import secure_sqlite_files
+            self._private_storage_verified = secure_sqlite_files(self._db_path)
 
     @contextmanager
     def _immediate_txn(self):

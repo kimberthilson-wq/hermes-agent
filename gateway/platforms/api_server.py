@@ -1342,8 +1342,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # "stopping" is not terminal: executor work continues until the agent notices.
         return sum(
             1
-            for status in self._run_statuses.values()
+            for run_id, status in self._run_statuses.items()
             if status.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
+            or (status.get("typed_delegation") and run_id in self._active_run_tasks
+                and not self._active_run_tasks[run_id].done())
         )
 
     @staticmethod
@@ -1560,6 +1562,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Validate the Bearer token; None when OK, else a 401. The no-key branch (connect()
         refuses to start without API_SERVER_KEY) exists for tests/manual wiring on the default
         listener only; named profiles fail closed rather than inherit the owner's key."""
+        # Scoped RoomLink grants never authorize administrative/generic API routes,
+        # including the legacy no-key test/manual-listener branch.
+        if str(request.headers.get("Authorization", "")).partition(" ")[0].lower() == "hermesroom":
+            return self._auth_failed_response()
         profile = _api_request_profile.get()
         expected_key = self._expected_api_key()
         if not expected_key:

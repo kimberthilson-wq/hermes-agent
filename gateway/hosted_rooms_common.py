@@ -9,6 +9,8 @@ logic lives once. Must stay a leaf: never import a hosted_room* module (import c
 from __future__ import annotations
 
 import json
+import os
+import stat
 import re
 import sqlite3
 import time
@@ -94,12 +96,58 @@ def clock(now: float | None) -> float:
     return time.time() if now is None else float(now)
 
 
+def secure_sqlite_files(path: DbPath, *, create: bool = False) -> bool:
+    """Create confidential DBs privately and restrict existing DB/WAL/SHM.
+
+    POSIX returns True only after verification, failing closed on symlinks,
+    foreign ownership or failed permissions. Unsupported platforms return False
+    without changing generic storage behavior; callers requiring private state
+    must reject that result. SQLite creates sidecars with the database mode.
+    No unrelated directory is chmodded.
+    """
+    if str(path) == ":memory:" or os.name != "posix" or not hasattr(os, "fchmod"):
+        return False
+    path = Path(path)
+    if create:
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    verified_db = False
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(str(path) + suffix)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        if suffix == "" and create:
+            flags |= os.O_CREAT
+        try:
+            fd = os.open(candidate, flags, 0o600)
+        except FileNotFoundError:
+            continue
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or (hasattr(os, "geteuid") and info.st_uid != os.geteuid()):
+                raise PermissionError("Sensitive SQLite state has unsafe ownership or type.")
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                os.fchmod(fd, 0o600)
+            if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+                raise PermissionError("Sensitive SQLite state permissions are not owner-only.")
+            if suffix == "":
+                verified_db = True
+        finally:
+            os.close(fd)
+    return verified_db
+
+
 def open_sqlite(path: DbPath, *, timeout: float = 10) -> sqlite3.Connection:
     """Row-factory connection with foreign keys on; no journal or schema work (steady-state readers)."""
     from hermes_cli.sqlite_util import open_db
 
-    return open_db(path, db_label="shared-state.db", busy_timeout_ms=int(timeout * 1000), wal=False,
+    secure_sqlite_files(path, create=True)
+    conn = open_db(path, db_label="shared-state.db", busy_timeout_ms=int(timeout * 1000), wal=False,
                    foreign_keys=True)
+    try:
+        secure_sqlite_files(path)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def connect(
@@ -123,8 +171,15 @@ def connect(
     # Late import: a gateway that outlives an on-disk upgrade has the OLD sqlite_util cached.
     from hermes_cli.sqlite_util import open_db
 
-    return open_db(db_path, db_label=db_label, busy_timeout_ms=10_000, foreign_keys=True,
+    secure_sqlite_files(db_path, create=True)
+    conn = open_db(db_path, db_label=db_label, busy_timeout_ms=10_000, foreign_keys=True,
                    wal_lock_retries=lock_retries, initialize=_initialize)
+    try:
+        secure_sqlite_files(db_path)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def fenced_update(conn: sqlite3.Connection, sql: str, params: tuple, error: Exception) -> None:

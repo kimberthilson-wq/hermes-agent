@@ -260,6 +260,13 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
     now = time.time()
     current = self._run_statuses.get(run_id, {})
     previous_status = str(current.get("status") or "")
+    if current.get("typed_delegation"):
+        if previous_status in TERMINAL_STATUSES and status != previous_status:
+            return current
+        if status in TERMINAL_STATUSES and previous_status not in TERMINAL_STATUSES and "provenance" not in fields:
+            provenance = dict(current["provenance"])
+            provenance.update(terminal_at=now, terminal_status=status, error_category="gateway_shutdown")
+            fields["provenance"] = provenance
     field_names = set(fields)
     current.update({"object": "hermes.run", "run_id": run_id, "status": status, "updated_at": now})
     current.setdefault("created_at", fields.pop("created_at", now))
@@ -362,6 +369,9 @@ def _run_idempotency_scope(self, request: "web.Request", *, _api_server) -> str:
     if self._room_grant_token(request):
         claims = self._room_grant_claims(request, permission=_room_permission_for(request))
         _remember_room_retention(request, claims)
+        if "typed_authority" in claims:
+            from gateway.platforms.api_server_typed_runs import owner_scope
+            return owner_scope(claims)
         parts = (claims[k] for k in (
             "room_id", "home_install_id", "authority_gateway_id", "authority_epoch",
             "member_id", "target_install_id", "target_profile"))
@@ -375,7 +385,15 @@ def _check_run_auth(self, request: "web.Request", *, permission: str, _api_serve
     if not self._room_grant_token(request):
         return self._check_auth(request)
     try:
-        self._room_grant_claims(request, permission=permission)
+        if permission == "approve":
+            status_claims = self._room_grant_claims(request, permission="status")
+            if "typed_authority" in status_claims:
+                return _json_error(_api_server._openai_error, "Typed delegation cannot acquire approval authority.",
+                    code="typed_approval_forbidden", status=403)
+        claims = self._room_grant_claims(request, permission=permission)
+        if "typed_authority" in claims:
+            from gateway.platforms.api_server_room_grants import _local_target
+            _local_target(claims, _api_server._api_request_profile)
     except Exception as exc:
         return _room_grant_error_response(exc, _openai_error=_api_server._openai_error)
     return None
@@ -411,6 +429,11 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
         status.update(
             status="interrupted", error="The gateway restarted before this run settled.",
             last_event="run.interrupted", updated_at=time.time())
+        if status.get("typed_delegation"):
+            provenance = dict(status["provenance"])
+            provenance.update(terminal_at=time.time(), terminal_status="interrupted",
+                error_category="owner_restarted")
+            status.update(provenance=provenance, error_category="owner_restarted")
         self._run_idempotency_store.update_status(run_id, status)
     self._run_statuses[run_id] = status
     self._run_idempotency_ids.add(run_id)
@@ -620,14 +643,25 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
 async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs — start an agent run, return run_id immediately."""
     _openai_error = _api_server._openai_error
-    # Long-term memory scope header (see chat_completions for details).
-    gateway_session_key, key_err = self._parse_session_key_header(request)
-    if key_err is not None:
-        return key_err
     try:
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
+    if isinstance(body, dict) and "typed_delegation" in body:
+        from gateway.platforms.api_server_typed_runs import handle
+        return await handle(self, request, body, api=_api_server)
+    if self._room_grant_token(request):
+        try:
+            from gateway.platforms.api_server_room_grants import _decode_request_grant
+            claims = _decode_request_grant(self, request, permission="dispatch")
+        except Exception as exc:
+            return _room_grant_error_response(exc, _openai_error=_openai_error)
+        if "typed_authority" in claims:
+            return _json_error(_openai_error, "Typed grants cannot dispatch generic agent work.",
+                code="typed_generic_execution_denied", status=403)
+    gateway_session_key, key_err = self._parse_session_key_header(request)
+    if key_err is not None:
+        return key_err
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
@@ -1058,12 +1092,21 @@ async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
     _, status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
-    return err or web.json_response(status)
+    if err is not None:
+        return err
+    if status.get("typed_delegation"):
+        from gateway.platforms.api_server_typed_runs import check_query
+        try:
+            check_query(status, request.query)
+        except (ValueError, TypeError):
+            return _json_error(_api_server._openai_error, "Typed result correlation rejected.",
+                code="typed_result_mismatch", status=409)
+    return web.json_response(status)
 
 
 async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":
     """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
-    auth_err = self._check_auth(request)
+    auth_err = self._check_run_auth(request, permission="status")
     if auth_err:
         return auth_err
     run_id = request.match_info["run_id"]
@@ -1259,6 +1302,9 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
         return err
     if status.get("status") in TERMINAL_STATUSES:
         return web.json_response(status)
+    if status.get("typed_delegation"):
+        from gateway.platforms.api_server_typed_runs import stop
+        return web.json_response(stop(self, run_id))
     if agent is None and task is None:
         return _json_error(
             _openai_error, f"Run is not active in this gateway process: {run_id}",
@@ -1297,6 +1343,6 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
             _unregister_approval_notify(self._run_approval_sessions.get(run_id))
             _retire_live_run(self, run_id)
     for run_id, status in list(self._run_statuses.items()):
-        if (status.get("status") in {"completed", "failed", "cancelled"}
+        if (status.get("status") in TERMINAL_STATUSES
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
             _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)

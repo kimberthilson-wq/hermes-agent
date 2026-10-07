@@ -409,7 +409,7 @@ def issue_room_grant(
     authority_epoch: int, member_id: str, target_install_id: str, target_profile: str,
     execution_policy_digest: str | None = None, permissions: Iterable[str] = ("approve", "dispatch", "status", "stop"),
     issued_at: float | None = None, ttl_seconds: float = 3600, status_ttl_seconds: float | None = None,
-    status_expires_at: float | None = None) -> str:
+    status_expires_at: float | None = None, typed_authority: dict | None = None) -> str:
     """Issue a target-verifiable bearer grant scoped to one room member."""
     if len(secret) < 32:
         raise HostedRoomGrantError("room grant secret must be at least 32 bytes")
@@ -426,6 +426,12 @@ def issue_room_grant(
     allowed = tuple(sorted(set(permissions)))
     if not allowed or not set(allowed) <= _GRANT_PERMISSIONS:
         raise HostedRoomGrantError("room grant permissions are invalid")
+    if typed_authority is not None:
+        from gateway.platforms.api_server_typed_tasks import validate_authority
+        typed_authority = validate_authority(typed_authority)
+        allowed = tuple(p for p in allowed if p != "approve")
+        if not allowed:
+            raise HostedRoomGrantError("typed room grant has no supported permissions")
     scope = locals()
     payload = {
         "version": PROTOCOL_VERSION,
@@ -435,6 +441,8 @@ def issue_room_grant(
             or execution_policy_mapping(target_profile=target_profile)["policy_digest"], field="execution_policy_digest"
         ), "permissions": list(allowed), "issued_at": now, "expires_at": now + float(ttl_seconds),
         "status_expires_at": bounded_status_expiry}
+    if typed_authority is not None:
+        payload["typed_authority"] = typed_authority
     encoded = _canonical_json(payload)
     token = f"{_b64encode(encoded)}.{_b64encode(hmac.new(secret, encoded, hashlib.sha256).digest())}"
     if len(token.encode("ascii")) > MAX_TOKEN_BYTES:
@@ -465,7 +473,9 @@ def decode_room_grant(secret: bytes, token: str, *, permission: str, now: float 
         payload = json.loads(encoded.decode("ascii"))
     except Exception as exc:
         raise HostedRoomGrantError("room grant payload is invalid") from exc
-    if not isinstance(payload, dict) or frozenset(payload) not in {_GRANT_FIELDS, _GRANT_REFRESH_FIELDS}:
+    allowed_fields = {_GRANT_FIELDS, _GRANT_REFRESH_FIELDS,
+        _GRANT_FIELDS | {"typed_authority"}, _GRANT_REFRESH_FIELDS | {"typed_authority"}}
+    if not isinstance(payload, dict) or frozenset(payload) not in allowed_fields:
         raise HostedRoomGrantError("room grant fields are invalid")
     if not math.isfinite(checked_now := clock(now)):
         raise HostedRoomGrantError("room grant clock is invalid")
@@ -483,6 +493,14 @@ def decode_room_grant(secret: bytes, token: str, *, permission: str, now: float 
         raise HostedRoomGrantError("room grant is expired or not active")
     if not isinstance(permissions := payload.get("permissions"), list) or permission not in permissions:
         raise HostedRoomGrantError("room grant does not allow this operation")
+    if "typed_authority" in payload:
+        from gateway.platforms.api_server_typed_tasks import validate_authority
+        try:
+            payload["typed_authority"] = validate_authority(payload["typed_authority"])
+        except ValueError as exc:
+            raise HostedRoomGrantError("room typed authority is invalid") from exc
+        if permission == "approve" or "approve" in permissions:
+            raise HostedRoomGrantError("typed room grants cannot grant approvals")
     return payload
 
 
