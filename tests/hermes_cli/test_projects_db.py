@@ -144,3 +144,145 @@ def test_per_profile_isolation(tmp_path):
         b.close()
 
 
+# ── Step 25: operator policy write (set_project_policy) ─────────────────────
+
+def _complete(conn, name="Policy Project"):
+    """Create a folder-backed project (so primary_path is set) — policy still NULL."""
+    return pdb.create_project(conn, name=name, folders=["/opt/proj"])
+
+
+def test_set_all_three_policy_fields(conn):
+    pid = _complete(conn)
+    assert pdb.set_project_policy(
+        conn, pid, ownership_class="HERMES_OWNED",
+        default_access_mode="READ_ONLY", canonical_source_type="LOCAL_FILE",
+    ) is True
+    p = pdb.get_project(conn, pid)
+    assert (p.ownership_class, p.default_access_mode, p.canonical_source_type) == (
+        "HERMES_OWNED", "READ_ONLY", "LOCAL_FILE")
+
+
+def test_partial_update_leaves_others(conn):
+    pid = _complete(conn)
+    pdb.set_project_policy(conn, pid, ownership_class="EXTERNAL_OWNED")
+    p = pdb.get_project(conn, pid)
+    # Only ownership changed; the other two remain NULL (untouched).
+    assert p.ownership_class == "EXTERNAL_OWNED"
+    assert p.default_access_mode is None
+    assert p.canonical_source_type is None
+    # Now a second partial call fills one more, leaving ownership intact.
+    pdb.set_project_policy(conn, pid, canonical_source_type="EXTERNAL_GIT_REPOSITORY")
+    p = pdb.get_project(conn, pid)
+    assert p.ownership_class == "EXTERNAL_OWNED"
+    assert p.canonical_source_type == "EXTERNAL_GIT_REPOSITORY"
+    assert p.default_access_mode is None
+
+
+def test_unknown_stored_when_explicit(conn):
+    pid = _complete(conn)
+    assert pdb.set_project_policy(conn, pid, ownership_class="UNKNOWN",
+                                  canonical_source_type="UNKNOWN") is True
+    p = pdb.get_project(conn, pid)
+    assert p.ownership_class == "UNKNOWN"
+    assert p.canonical_source_type == "UNKNOWN"
+    # But default_access_mode has no UNKNOWN; it stays NULL until explicitly set.
+    assert p.default_access_mode is None
+
+
+def test_invalid_ownership_rejected(conn):
+    pid = _complete(conn)
+    with pytest.raises(ValueError):
+        pdb.set_project_policy(conn, pid, ownership_class="SOMEONE_ELSE")
+    assert pdb.get_project(conn, pid).ownership_class is None
+
+
+def test_read_write_access_rejected(conn):
+    pid = _complete(conn)
+    with pytest.raises(ValueError, match="invalid default_access_mode"):
+        pdb.set_project_policy(conn, pid, default_access_mode="READ_WRITE")
+    assert pdb.get_project(conn, pid).default_access_mode is None
+
+
+def test_lowercase_value_rejected(conn):
+    pid = _complete(conn)
+    # Exact, case-sensitive: lowercase is an invalid value, not a normalization target.
+    with pytest.raises(ValueError):
+        pdb.set_project_policy(conn, pid, ownership_class="hermes_owned")
+    with pytest.raises(ValueError):
+        pdb.set_project_policy(conn, pid, canonical_source_type="local_file")
+
+
+def test_empty_string_rejected(conn):
+    pid = _complete(conn)
+    with pytest.raises(ValueError):
+        pdb.set_project_policy(conn, pid, ownership_class="")
+    with pytest.raises(ValueError):
+        pdb.set_project_policy(conn, pid, ownership_class="   ")
+
+
+def test_missing_project_rejected(conn):
+    with pytest.raises(ValueError, match="no such project"):
+        pdb.set_project_policy(conn, "ghost", ownership_class="HERMES_OWNED")
+
+
+def test_no_fields_returns_false(conn):
+    pid = _complete(conn)
+    assert pdb.set_project_policy(conn, pid) is False
+    p = pdb.get_project(conn, pid)
+    assert (p.ownership_class, p.default_access_mode, p.canonical_source_type) == (None, None, None)
+
+
+def test_only_policy_columns_change(conn):
+    pid = _complete(conn)
+    before = pdb.get_project(conn, pid)
+    pdb.set_project_policy(conn, pid, ownership_class="HERMES_OWNED")
+    after = pdb.get_project(conn, pid)
+    # Identity/relationship fields are untouched.
+    assert after.id == before.id
+    assert after.slug == before.slug
+    assert after.name == before.name
+    assert after.primary_path == before.primary_path
+    assert [f.path for f in after.folders] == [f.path for f in before.folders]
+    assert after.board_slug == before.board_slug
+
+
+def test_resolve_project_is_registry_backed_not_db_backed(conn, tmp_path):
+    # Step 37: the resolver reads canonical identity/policy from the Registry,
+    # NOT from projects.db. A DB row with a complete policy is therefore NOT
+    # enough for Worker-Core resolution — it is a workspace project, not a
+    # Registry project. The DB pid fails closed (ProjectUnknown).
+    pid = _complete(conn)
+    pdb.set_project_policy(
+        conn, pid, ownership_class="HERMES_OWNED",
+        default_access_mode="READ_ONLY", canonical_source_type="LOCAL_FILE",
+    )
+    # The DB row is fully populated, yet...
+    assert pdb.get_project(conn, pid).ownership_class == "HERMES_OWNED"
+    with pytest.raises(pdb.ProjectUnknown):
+        pdb.resolve_project(conn, pid)
+    # ...and the SAME reference resolves fine against a matching Registry.
+    reg = tmp_path / "HERMES_PROJECT_REGISTRY.md"
+    reg.write_text(
+        "<!-- registry-entry -->\n"
+        f"project_id: {pid}\n"
+        "project_name: From Registry\n"
+        "ownership_class: HERMES_OWNED\n"
+        "canonical_source_type: LOCAL_FILE\n"
+        "default_access_mode: READ_ONLY\n"
+        "canonical_root: /registry/canonical\n"
+        "status: ACTIVE\n"
+        "<!-- /registry-entry -->\n",
+        encoding="utf-8",
+    )
+    r = pdb.resolve_project(conn, pid, registry_path=reg)
+    assert r.ownership_class == "HERMES_OWNED"
+    assert r.default_access_mode == "READ_ONLY"
+    assert r.canonical_source_type == "LOCAL_FILE"
+    assert r.canonical_root == "/registry/canonical"
+
+
+def test_set_policy_rejects_unknown_access_value(conn):
+    # UNKNOWN is NOT a valid default_access_mode (unlike ownership/source).
+    pid = _complete(conn)
+    with pytest.raises(ValueError):
+        pdb.set_project_policy(conn, pid, default_access_mode="UNKNOWN")

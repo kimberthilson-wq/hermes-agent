@@ -57,5 +57,73 @@ def test_rename_and_archive(tmp_path):
         assert len(pdb.list_projects(conn)) == 1
 
 
+# ── Step 25: hermes project set-policy ───────────────────────────────────────
+
+def _create_policy_project(tmp_path, name="Policy CLI"):
+    """Create a folder-backed project (primary_path set) and return its slug."""
+    _run(["create", name, str(tmp_path)])
+    with pdb.connect_closing() as conn:
+        return pdb.list_projects(conn)[0].slug
+
+
+def test_set_policy_all_fields(capsys, tmp_path):
+    slug = _create_policy_project(tmp_path)
+    rc = _run(["set-policy", slug, "--ownership", "HERMES_OWNED",
+               "--access", "READ_ONLY", "--source", "LOCAL_FILE"])
+    assert rc == 0
+    assert "Policy set for" in capsys.readouterr().out
+    with pdb.connect_closing() as conn:
+        p = pdb.get_project(conn, slug)
+        assert (p.ownership_class, p.default_access_mode, p.canonical_source_type) == (
+            "HERMES_OWNED", "READ_ONLY", "LOCAL_FILE")
+
+
+def test_set_policy_partial(capsys, tmp_path):
+    slug = _create_policy_project(tmp_path)
+    assert _run(["set-policy", slug, "--ownership", "EXTERNAL_OWNED"]) == 0
+    capsys.readouterr()
+    with pdb.connect_closing() as conn:
+        p = pdb.get_project(conn, slug)
+        assert p.ownership_class == "EXTERNAL_OWNED"
+        assert p.default_access_mode is None
+        assert p.canonical_source_type is None
+
+
+def test_set_policy_exact_id_and_slug_resolution(tmp_path):
+    slug = _create_policy_project(tmp_path, name="Ref Lookup")
+    with pdb.connect_closing() as conn:
+        pid = pdb.get_project(conn, slug).id
+    # Both the id and the slug resolve to the same project.
+    assert _run(["set-policy", slug, "--ownership", "HERMES_OWNED"]) == 0
+    assert _run(["set-policy", pid, "--access", "READ_ONLY"]) == 0
+    with pdb.connect_closing() as conn:
+        p = pdb.get_project(conn, slug)
+        assert p.ownership_class == "HERMES_OWNED"
+        assert p.default_access_mode == "READ_ONLY"
+
+
+def test_set_policy_missing_project(capsys, tmp_path):
+    rc = _run(["set-policy", "no-such-project", "--ownership", "HERMES_OWNED"])
+    assert rc == 1
+    assert "no such project" in capsys.readouterr().err
+
+
+def test_set_policy_no_flags_errors(capsys, tmp_path):
+    slug = _create_policy_project(tmp_path)
+    rc = _run(["set-policy", slug])
+    assert rc == 1
+    assert "at least one" in capsys.readouterr().err
+
+
+def test_set_policy_invalid_value_errors(capsys, tmp_path):
+    slug = _create_policy_project(tmp_path)
+    rc = _run(["set-policy", slug, "--access", "READ_WRITE"])
+    assert rc == 2
+    assert "invalid" in capsys.readouterr().err
+    # Nothing was written.
+    with pdb.connect_closing() as conn:
+        assert pdb.get_project(conn, slug).default_access_mode is None
+
+
 
 

@@ -46,6 +46,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_add.add_argument("--primary", action="store_true", help="Mark as primary repo")
     project_sub("remove-folder", "Remove a folder from a project").add_argument("path", help="Folder path")
     project_sub("rename", "Rename a project").add_argument("name", help="New name")
+    p_set_policy = project_sub("set-policy", "Set a project's read-path policy (ownership/access/source)")
+    p_set_policy.add_argument("--ownership", default=None, metavar="VALUE",
+                              help="ownership_class: HERMES_OWNED | EXTERNAL_OWNED | UNKNOWN")
+    p_set_policy.add_argument("--access", default=None, metavar="VALUE",
+                              help="default_access_mode: READ_ONLY")
+    p_set_policy.add_argument("--source", default=None, metavar="VALUE",
+                              help="canonical_source_type: LOCAL_FILE | EXTERNAL_GIT_REPOSITORY | UNKNOWN")
     project_sub("set-primary", "Set the primary folder").add_argument("path", help="Folder path (must already be in project)")
     p_use = sub.add_parser("use", help="Set the active project")
     p_use.add_argument("project", nargs="?", default=None, help="Project id or slug (omit to clear)")
@@ -185,6 +192,21 @@ def _cmd_rename(args, conn, proj) -> str:
 
 
 @_with_project
+def _cmd_set_policy(args, conn, proj):
+    ownership = getattr(args, "ownership", None)
+    access = getattr(args, "access", None)
+    source = getattr(args, "source", None)
+    if ownership is None and access is None and source is None:
+        return _err("provide at least one of --ownership / --access / --source")
+    # Value errors (invalid vocabulary) are raised here and caught by _db_command (rc 2).
+    pdb.set_project_policy(
+        conn, proj.id,
+        ownership_class=ownership, default_access_mode=access, canonical_source_type=source,
+    )
+    return f"Policy set for {proj.slug}"
+
+
+@_with_project
 def _cmd_set_primary(args, conn, proj):
     if not pdb.set_primary(conn, proj.id, args.path):
         return _err(f"'{args.path}' is not a folder of {proj.slug}; add it first with `hermes project add-folder`.")
@@ -233,6 +255,7 @@ _HANDLERS = {
     "add-folder": _cmd_add_folder,
     "remove-folder": _cmd_remove_folder,
     "rename": _cmd_rename,
+    "set-policy": _cmd_set_policy,
     "set-primary": _cmd_set_primary,
     "use": _cmd_use,
     "archive": _flag_command("archive_project", "Archived"),

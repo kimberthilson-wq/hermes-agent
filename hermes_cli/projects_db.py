@@ -14,7 +14,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Literal, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, open_db, write_txn
 from hermes_constants import get_hermes_home
@@ -73,10 +73,13 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 _BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
 _INITIALIZED_PATHS: set[str] = set()
 # TEXT columns added to `projects` after v1; re-applied idempotently on every open so a legacy DB
-# upgrades in place.
-_OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color")
+# upgrades in place. The three policy columns (Step 21) are nullable: NULL means the policy is
+# unresolved and ``resolve_project`` fails closed on them.
+_OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color",
+                             "ownership_class", "default_access_mode", "canonical_source_type")
 # Nullable TEXT columns that may be absent from a legacy row.
-_OPTIONAL_ROW_FIELDS = ("description", "icon", "color", "board_slug", "primary_path")
+_OPTIONAL_ROW_FIELDS = ("description", "icon", "color", "board_slug", "primary_path",
+                        "ownership_class", "default_access_mode", "canonical_source_type")
 _ACTIVE_META_KEY = "active_id"
 _DISCOVERY_POLICY_META_KEY = "repo_discovery_policy"
 
@@ -168,6 +171,11 @@ class Project:
     board_slug: Optional[str] = None
     primary_path: Optional[str] = None
     archived: bool = False
+    # Policy metadata (Step 21). Nullable: NULL / "UNKNOWN" are unresolved and fail closed in
+    # ``resolve_project``; they are never inferred. Vocabulary per HERMES_PROJECT_REGISTRY.md.
+    ownership_class: Optional[str] = None
+    default_access_mode: Optional[str] = None
+    canonical_source_type: Optional[str] = None
     folders: List[ProjectFolder] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -293,6 +301,63 @@ def update_project(
         return False
     sets = ", ".join(f"{col} = ?" for col, _, _ in fields)
     return _execute_rowcount(conn, f"UPDATE projects SET {sets} WHERE id = ?", [f[2] for f in fields] + [project_id]) > 0
+
+
+# Write-time policy vocabulary (Step 25). These are the ONLY accepted values when an
+# operator explicitly sets a field. UNKNOWN is a legitimate explicit operator choice for
+# ownership_class and canonical_source_type; it is NOT a valid default_access_mode. The
+# resolver still fails closed on any stored UNKNOWN (it only resolves complete policy).
+_POLICY_WRITE_VOCAB = {
+    "ownership_class": ("HERMES_OWNED", "EXTERNAL_OWNED", "UNKNOWN"),
+    "default_access_mode": ("READ_ONLY",),
+    "canonical_source_type": ("LOCAL_FILE", "EXTERNAL_GIT_REPOSITORY", "UNKNOWN"),
+}
+
+
+def _validate_policy_value(field: str, value) -> str:
+    """Exact, case-sensitive validation of one operator-supplied policy value.
+
+    Rejects empty / whitespace-only / non-string / any value outside the write
+    vocabulary. No inference, no Registry lookup, no filesystem/Git derivation.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty value")
+    allowed = _POLICY_WRITE_VOCAB[field]
+    if value not in allowed:
+        raise ValueError(f"invalid {field}: {value!r}; expected one of {' | '.join(allowed)}")
+    return value
+
+
+def set_project_policy(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    ownership_class: Optional[str] = None,
+    default_access_mode: Optional[str] = None,
+    canonical_source_type: Optional[str] = None,
+) -> bool:
+    """Atomically set the policy fields of an EXISTING project; only provided fields change.
+
+    ``None`` leaves a field untouched. At least one field must be provided. The project must
+    already exist (resolved via the exact ``get_project`` id-then-slug semantics — no path
+    lookup, cwd, fuzzy/prefix, or implicit create). Only the three policy columns are ever
+    written. One UPDATE in a single write txn. Returns ``False`` if no field was provided;
+    raises ``ValueError`` for a missing project or an invalid value.
+    """
+    if get_project(conn, project_id) is None:
+        raise ValueError("no such project")
+    provided = (
+        ("ownership_class", ownership_class),
+        ("default_access_mode", default_access_mode),
+        ("canonical_source_type", canonical_source_type),
+    )
+    fields = [(col, _validate_policy_value(col, val)) for col, val in provided if val is not None]
+    if not fields:
+        return False
+    sets = ", ".join(f"{col} = ?" for col, _ in fields)
+    return _execute_rowcount(
+        conn, f"UPDATE projects SET {sets} WHERE id = ?", [val for _, val in fields] + [project_id]
+    ) > 0
 
 
 def _execute_rowcount(conn: sqlite3.Connection, sql: str, params) -> int:
@@ -483,3 +548,187 @@ def branch_name_for(project: Project, task_id: str, *, title: str = "") -> str:
     base = f"{project.slug or _slugify(project.name)}/{task_id}"
     tslug = _BRANCH_SAFE_RE.sub("-", str(title).strip().lower()).strip("-")[:40].strip("-") if title else ""
     return f"{base}-{tslug}" if tslug else base
+
+
+# ---------------------------------------------------------------------------
+# Project resolution contract (Step 21) — read-path only.
+#
+# The resolver exposes policy metadata and never grants write authority:
+# ``default_access_mode`` is a ceiling, not authorization, and every write
+# requires a separate, current, project-specific approval (a later layer).
+# Vocabulary per HERMES_PROJECT_REGISTRY.md — it is NOT consulted at runtime;
+# the DB row is the source of truth for this contract.
+# ---------------------------------------------------------------------------
+
+class ProjectResolutionError(Exception):
+    """Base type for all project-resolution failures."""
+
+
+class ProjectUnknown(ProjectResolutionError):
+    """No project with the exact id/slug ``ref`` exists."""
+
+    def __init__(self, ref: str) -> None:
+        super().__init__(f"unknown project: {ref!r}")
+        self.ref = ref
+
+
+class ProjectArchived(ProjectResolutionError):
+    """The project exists but is archived."""
+
+    def __init__(self, ref: str) -> None:
+        super().__init__(f"project is archived: {ref!r}")
+        self.ref = ref
+
+
+class ProjectPolicyIncomplete(ProjectResolutionError):
+    """A policy field is missing, explicitly UNKNOWN, or holds an invalid value."""
+
+    def __init__(self, ref: str, field: str, reason: Literal["missing", "unknown", "invalid"],
+                 value: Optional[str] = None) -> None:
+        super().__init__(f"project policy incomplete: {ref!r} field={field!r} reason={reason!r}")
+        self.ref = ref
+        self.field = field
+        self.reason = reason
+        self.value = value
+
+
+class ProjectAccessDenied(ProjectResolutionError):
+    """The requested access mode is denied by the project's policy ceiling."""
+
+    def __init__(self, ref: str, requested_access: Literal["read", "write"]) -> None:
+        super().__init__(f"access denied for {requested_access!r}: {ref!r}")
+        self.ref = ref
+        self.requested_access = requested_access
+
+
+# Allowed policy values (HERMES_PROJECT_REGISTRY.md vocabulary). UNKNOWN is a
+# stored value meaning "explicitly unresolved" and is rejected below.
+_PROJECT_OWNERSHIP_CLASSES = ("HERMES_OWNED", "EXTERNAL_OWNED")
+_PROJECT_SOURCE_TYPES = ("LOCAL_FILE", "EXTERNAL_GIT_REPOSITORY")
+_PROJECT_ACCESS_MODES = ("READ_ONLY",)
+
+
+@dataclass(frozen=True)
+class ResolvedProject:
+    """Read-path resolution result: identity + verified policy metadata."""
+    id: str
+    slug: str
+    name: str
+    canonical_root: str
+    canonical_source_type: str
+    ownership_class: str
+    default_access_mode: str
+
+
+def _check_policy_field(ref: str, field: str, value: Optional[str], allowed: tuple[str, ...]) -> str:
+    """Fail closed on one policy field; return the verified value."""
+    if value is None or not str(value).strip():
+        raise ProjectPolicyIncomplete(ref, field, "missing")
+    v = str(value).strip()
+    if v == "UNKNOWN":
+        raise ProjectPolicyIncomplete(ref, field, "unknown", value=v)
+    if v not in allowed:
+        raise ProjectPolicyIncomplete(ref, field, "invalid", value=v)
+    return v
+
+
+def resolve_project(
+    conn,
+    ref: str,
+    *,
+    for_access: Literal["read", "write"] = "read",
+    registry_path=None,
+) -> ResolvedProject:
+    """Resolve ``ref`` (exact Registry ``project_id``) to a frozen :class:`ResolvedProject`.
+
+    Step 37: the canonical identity + policy source is
+    ``HERMES_PROJECT_REGISTRY.md`` (single source of truth per Step 36). This
+    resolver REUSES the ``hermes_cli.vault_hub`` Registry parser — it does not
+    parse the Registry a second time and does NOT read the ``projects.db``
+    policy columns (``ownership_class`` / ``default_access_mode`` /
+    ``canonical_source_type`` are now non-authoritative here; the schema is left
+    intact). ``projects.db`` remains the operational workspace store for the
+    GUI/CLI/TUI/kanban consumers and is untouched by this read path.
+
+    Read-path only: write requests are always denied at this layer — the
+    ``default_access_mode`` ceiling (READ_ONLY) is not authorization, and every
+    write requires a separate, current, project-specific approval handled by a
+    later layer. Fails closed on unknown projects, archived/inactive projects
+    (explicit Registry ``status``), and any missing / UNKNOWN / invalid policy
+    value. No fuzzy, prefix, cwd, or path-based inference; only the exact
+    Registry ``project_id`` resolves.
+
+    ``conn`` is retained for API compatibility with the Step 21 signature and is
+    unused by this (Registry-backed) implementation. ``registry_path`` (optional)
+    overrides the Registry file (tests); default is the live Registry.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    from hermes_cli import vault_hub as _vault_hub
+
+    project_id = str(ref if ref is not None else "").strip()
+    if not project_id:
+        raise ProjectUnknown(ref)
+    # Identity space is Registry project_id only: reject path/cwd/prefix-style refs.
+    if "/" in project_id or "\\" in project_id or ".." in project_id or _os.sep in project_id or project_id.startswith("~"):
+        raise ProjectUnknown(ref)
+
+    # Exact-id Registry lookup via the shared parser (no second parser).
+    _rp = _Path(registry_path) if registry_path is not None else None
+    try:
+        entry = _vault_hub.resolve_registry_entry(project_id, registry_path=_rp)
+    except _vault_hub.VaultHubProjectNotFound:
+        raise ProjectUnknown(ref)
+
+    # Archived / inactive: explicit Registry ``status`` token only (never inferred).
+    status = (entry.get("status") or "").strip().lower()
+    if status in ("archived", "inactive"):
+        raise ProjectArchived(ref)
+
+    if for_access == "write":
+        raise ProjectAccessDenied(ref, "write")
+
+    name = (entry.get("project_name") or "").strip() or project_id
+
+    # canonical_root comes from the Registry, never from DB primary_path.
+    root = (entry.get("canonical_root") or "").strip()
+    if not root:
+        raise ProjectPolicyIncomplete(ref, "canonical_root", "missing")
+    if root.upper() == "UNKNOWN":
+        raise ProjectPolicyIncomplete(ref, "canonical_root", "unknown", value=root)
+
+    ownership_class = _check_policy_field(ref, "ownership_class", entry.get("ownership_class"), _PROJECT_OWNERSHIP_CLASSES)
+    canonical_source_type = _check_policy_field(ref, "canonical_source_type", entry.get("canonical_source_type"), _PROJECT_SOURCE_TYPES)
+    default_access_mode = _check_policy_field(ref, "default_access_mode", entry.get("default_access_mode"), _PROJECT_ACCESS_MODES)
+
+    return ResolvedProject(
+        id=project_id,
+        slug=project_id,
+        name=name,
+        canonical_root=root,
+        canonical_source_type=canonical_source_type,
+        ownership_class=ownership_class,
+        default_access_mode=default_access_mode,
+    )
+
+
+def is_within(root: str, path: str) -> bool:
+    """True iff real path ``path`` is inside real path ``root`` (root itself excluded is
+    allowed: a file equal to the root counts as within).
+
+    Read-only, no DB access, no writes. Uses ``os.path.realpath`` so symlinks are
+    resolved before comparison — a symlink that escapes ``root`` yields False.
+    Sibling paths that merely share a longer prefix (e.g. ``/a/bc`` vs ``/a/b``)
+    are rejected by comparing on a separator boundary, not raw string prefix.
+    Empty / invalid inputs return False.
+    """
+    try:
+        r = os.path.realpath(str(root)) if root else ""
+        p = os.path.realpath(str(path)) if path else ""
+    except (OSError, TypeError, ValueError):
+        return False
+    if not r or not p:
+        return False
+    r = r.rstrip(os.sep) or os.sep
+    return p == r or p.startswith(r + os.sep)
